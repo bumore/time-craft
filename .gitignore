@@ -30,3 +30,6 @@ Desktop.ini
 venv/
 .venv/
 env/
+
+# 计划文件
+plan/
