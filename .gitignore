@@ -33,3 +33,6 @@ env/
 
 # 计划文件
 plan/
+
+# Agent 文档
+AGENTS.md
