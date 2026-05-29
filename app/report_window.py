@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import ctypes
 import ctypes.wintypes
+import sys
 import threading
 import time
 from datetime import datetime
@@ -53,8 +54,17 @@ user32.ShowWindow.restype = ctypes.wintypes.BOOL
 user32.SetForegroundWindow.restype = ctypes.wintypes.BOOL
 user32.SetWindowTextW.restype = ctypes.wintypes.BOOL
 user32.SetWindowTextW.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.LPCWSTR]
+user32.PostMessageW.restype = ctypes.wintypes.BOOL
+user32.PostMessageW.argtypes = [
+    ctypes.wintypes.HWND,
+    ctypes.wintypes.UINT,
+    ctypes.wintypes.WPARAM,
+    ctypes.wintypes.LPARAM,
+]
 user32.BringWindowToTop.restype = ctypes.wintypes.BOOL
 user32.SetActiveWindow.restype = ctypes.wintypes.HWND
+user32.IsWindowVisible.restype = ctypes.wintypes.BOOL
+user32.IsWindowVisible.argtypes = [ctypes.wintypes.HWND]
 user32.DrawTextW.restype = ctypes.c_int
 user32.DrawTextW.argtypes = [
     ctypes.wintypes.HDC,
@@ -67,13 +77,35 @@ user32.SetScrollInfo.restype = ctypes.c_int
 user32.SetScrollInfo.argtypes = [ctypes.wintypes.HWND, ctypes.c_int, ctypes.c_void_p, ctypes.wintypes.BOOL]
 user32.ShowScrollBar.restype = ctypes.wintypes.BOOL
 user32.ShowScrollBar.argtypes = [ctypes.wintypes.HWND, ctypes.c_int, ctypes.wintypes.BOOL]
+user32.SetTimer.restype = ctypes.c_size_t
+user32.SetTimer.argtypes = [ctypes.wintypes.HWND, ctypes.c_size_t, ctypes.wintypes.UINT, ctypes.c_void_p]
+user32.KillTimer.restype = ctypes.wintypes.BOOL
+user32.KillTimer.argtypes = [ctypes.wintypes.HWND, ctypes.c_size_t]
 gdi32.CreateFontW.restype = ctypes.wintypes.HANDLE
+gdi32.CreateCompatibleDC.restype = ctypes.wintypes.HDC
+gdi32.CreateCompatibleDC.argtypes = [ctypes.wintypes.HDC]
+gdi32.CreateCompatibleBitmap.restype = ctypes.wintypes.HBITMAP
+gdi32.CreateCompatibleBitmap.argtypes = [ctypes.wintypes.HDC, ctypes.c_int, ctypes.c_int]
 gdi32.CreateSolidBrush.restype = ctypes.wintypes.HANDLE
 gdi32.CreateSolidBrush.argtypes = [ctypes.wintypes.COLORREF]
+gdi32.BitBlt.restype = ctypes.wintypes.BOOL
+gdi32.BitBlt.argtypes = [
+    ctypes.wintypes.HDC,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.wintypes.HDC,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.wintypes.DWORD,
+]
 gdi32.CreatePen.restype = ctypes.wintypes.HANDLE
 gdi32.CreatePen.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.wintypes.COLORREF]
 gdi32.SelectObject.restype = ctypes.wintypes.HANDLE
 gdi32.SelectObject.argtypes = [ctypes.wintypes.HDC, ctypes.wintypes.HANDLE]
+gdi32.DeleteDC.restype = ctypes.wintypes.BOOL
+gdi32.DeleteDC.argtypes = [ctypes.wintypes.HDC]
 gdi32.SaveDC.restype = ctypes.c_int
 gdi32.SaveDC.argtypes = [ctypes.wintypes.HDC]
 gdi32.RestoreDC.restype = ctypes.wintypes.BOOL
@@ -113,11 +145,13 @@ WM_SIZE = 0x0005
 WM_CLOSE = 0x0010
 WM_PAINT = 0x000F
 WM_ERASEBKGND = 0x0014
+WM_TIMER = 0x0113
 WM_LBUTTONUP = 0x0202
 WM_MOUSEMOVE = 0x0200
 WM_MOUSEWHEEL = 0x020A
 WM_VSCROLL = 0x0115
 WM_NCHITTEST = 0x0084
+WM_REPORT_REFRESH = 0x8001
 
 WS_VISIBLE = 0x10000000
 WS_POPUP = 0x80000000
@@ -127,6 +161,7 @@ IDC_ARROW = 32512
 HTCLIENT = 1
 HTCAPTION = 2
 TRANSPARENT = 1
+SRCCOPY = 0x00CC0020
 
 SB_VERT = 1
 SB_LINEUP = 0
@@ -172,6 +207,8 @@ DRAG_REGION_BOTTOM = 56
 SCROLL_STEP = 56
 APP_BLOCK_GAP = 10
 MAX_CONTENT_WIDTH = 576
+AUTO_REFRESH_INTERVAL_MS = 5000
+REPORT_AUTO_REFRESH_TIMER_ID = 1
 
 _report_window_state = {
     "thread": None,
@@ -343,6 +380,7 @@ def _empty_report_data():
             "total_scroll": 0,
             "scroll_up": 0,
             "scroll_down": 0,
+            "scroll_lines": 0,
             "distance": "0 像素 (约0.00米)",
         },
         "apps": [],
@@ -386,6 +424,7 @@ def _normalize_report_data(report_data):
         "total_scroll": mouse.get("total_scroll", 0),
         "scroll_up": mouse.get("scroll_up", 0),
         "scroll_down": mouse.get("scroll_down", 0),
+        "scroll_lines": mouse.get("scroll_lines", 0),
         "distance": mouse.get("distance", "0 像素 (约0.00米)"),
     }
 
@@ -734,15 +773,16 @@ def _build_cards(report, client_width):
     )
     y += small_card_height + CARD_GAP
 
-    mouse_columns = 3
+    mouse_columns = 6
     mouse_metrics = [
-        _metric_item("总点击", f"{report['mouse']['total_clicks']} 次"),
-        _metric_item("左键", f"{report['mouse']['left_clicks']} 次"),
-        _metric_item("右键", f"{report['mouse']['right_clicks']} 次"),
-        _metric_item("滚轮", f"{report['mouse']['total_scroll']} 次"),
-        _metric_item("向上", f"{report['mouse']['scroll_up']} 次"),
-        _metric_item("向下", f"{report['mouse']['scroll_down']} 次"),
-        _metric_item("移动", report["mouse"]["distance"], span=3),
+        _metric_item("总点击", f"{report['mouse']['total_clicks']} 次", span=2),
+        _metric_item("左键", f"{report['mouse']['left_clicks']} 次", span=2),
+        _metric_item("右键", f"{report['mouse']['right_clicks']} 次", span=2),
+        _metric_item("总滑动", f"{report['mouse']['total_scroll']} 次", span=2),
+        _metric_item("向上", f"{report['mouse']['scroll_up']} 次", span=2),
+        _metric_item("向下", f"{report['mouse']['scroll_down']} 次", span=2),
+        _metric_item("移动距离", report["mouse"]["distance"], span=3),
+        _metric_item("滚动行数", f"约 {report['mouse']['scroll_lines']} 行", span=3),
     ]
     mouse_height = _metric_card_height(mouse_metrics, mouse_columns)
     cards.append(
@@ -788,30 +828,39 @@ def _clamp_scroll(hwnd, state, new_scroll):
         return
     state["scroll_y"] = bounded
     _set_scroll(hwnd, state, client_height)
-    user32.InvalidateRect(hwnd, None, True)
+    user32.InvalidateRect(hwnd, None, False)
 
 
-def _refresh_existing_window(report_data, title):
+def _refresh_existing_window(report_data, title, report_loader=None):
     with _report_window_lock:
         hwnd = _report_window_state["hwnd"]
         state = _report_window_state["state"]
+        if not _is_live_window(hwnd) or state is None:
+            return False
+        state["pending_refresh"] = {
+            "report_data": report_data,
+            "title": title,
+            "report_loader": report_loader,
+        }
 
-    if not _is_live_window(hwnd) or state is None:
+    if not user32.PostMessageW(hwnd, WM_REPORT_REFRESH, 0, 0):
         return False
-
-    normalized_report = _normalize_report_data(report_data)
-    state["report"] = normalized_report
-    state["title_text"] = title
-    state["subtitle_text"] = _build_subtitle_text(normalized_report.get("date"))
-    state["scroll_y"] = 0
-    state["layout_dirty"] = True
-    state["last_error"] = None
-    user32.SetWindowTextW(hwnd, title)
-    user32.InvalidateRect(hwnd, None, True)
     return _focus_report_window(hwnd)
 
 
-def _run_report_window(report_data, title):
+def _apply_report_data(state, report_data, title=None, reset_scroll=False):
+    normalized_report = _normalize_report_data(report_data)
+    state["report"] = normalized_report
+    if title is not None:
+        state["title_text"] = title
+    state["subtitle_text"] = _build_subtitle_text(normalized_report.get("date"))
+    if reset_scroll:
+        state["scroll_y"] = 0
+    state["layout_dirty"] = True
+    state["last_error"] = None
+
+
+def _run_report_window(report_data, title, report_loader=None):
     hinstance = kernel32.GetModuleHandleW(None)
     class_name = f"TimeCraftReportWindow_{kernel32.GetCurrentThreadId()}_{int(time.time() * 1000)}"
     normalized_report = _normalize_report_data(report_data)
@@ -861,6 +910,8 @@ def _run_report_window(report_data, title):
         "cards": [],
         "layout_dirty": True,
         "last_error": None,
+        "report_loader": report_loader,
+        "pending_refresh": None,
     }
 
     def update_layout(hwnd):
@@ -878,32 +929,29 @@ def _run_report_window(report_data, title):
         state["layout_dirty"] = False
         _set_scroll(hwnd, state, client_height)
 
-    def paint_window(hwnd):
-        paint = PAINTSTRUCT()
-        hdc = user32.BeginPaint(hwnd, ctypes.byref(paint))
+    def _paint_scene(hdc, client_rect):
+        if state["layout_dirty"]:
+            update_layout(hwnd)
+
+        user32.FillRect(hdc, ctypes.byref(client_rect), state["root_brush"])
+
+        client_width = client_rect.right - client_rect.left
+        client_height = client_rect.bottom - client_rect.top
+        _draw_window_frame(hdc, client_width, client_height, state)
+
+        header_title_rect = (WINDOW_PADDING, 11, client_width - 84, 33)
+        header_subtitle_rect = (WINDOW_PADDING, 35, client_width - 84, 50)
+        close_rect = state["close_rect"]
+
+        _draw_text(hdc, state["title_text"], header_title_rect, fonts["title"], colors["title"], DT_LEFT | DT_VCENTER | DT_SINGLELINE)
+        _draw_text(hdc, state["subtitle_text"], header_subtitle_rect, fonts["subtitle"], colors["muted"], DT_LEFT | DT_VCENTER | DT_SINGLELINE)
+
+        if state["close_hot"]:
+            _draw_round_rect(hdc, close_rect, colors["close_hover"], colors["close_hover"], radius=14)
+        _draw_text(hdc, "×", close_rect, fonts["close"], colors["muted"], DT_CENTER | DT_VCENTER | DT_SINGLELINE)
+
+        saved_dc = gdi32.SaveDC(hdc)
         try:
-            if state["layout_dirty"]:
-                update_layout(hwnd)
-            client_rect = ctypes.wintypes.RECT()
-            user32.GetClientRect(hwnd, ctypes.byref(client_rect))
-            user32.FillRect(hdc, ctypes.byref(client_rect), state["root_brush"])
-
-            client_width = client_rect.right - client_rect.left
-            client_height = client_rect.bottom - client_rect.top
-            _draw_window_frame(hdc, client_width, client_height, state)
-
-            header_title_rect = (WINDOW_PADDING, 11, client_width - 84, 33)
-            header_subtitle_rect = (WINDOW_PADDING, 35, client_width - 84, 50)
-            close_rect = state["close_rect"]
-
-            _draw_text(hdc, state["title_text"], header_title_rect, fonts["title"], colors["title"], DT_LEFT | DT_VCENTER | DT_SINGLELINE)
-            _draw_text(hdc, state["subtitle_text"], header_subtitle_rect, fonts["subtitle"], colors["muted"], DT_LEFT | DT_VCENTER | DT_SINGLELINE)
-
-            if state["close_hot"]:
-                _draw_round_rect(hdc, close_rect, colors["close_hover"], colors["close_hover"], radius=14)
-            _draw_text(hdc, "×", close_rect, fonts["close"], colors["muted"], DT_CENTER | DT_VCENTER | DT_SINGLELINE)
-
-            saved_dc = gdi32.SaveDC(hdc)
             gdi32.IntersectClipRect(hdc, 0, HEADER_HEIGHT, client_width, client_height)
             for card in state["cards"]:
                 card_rect = card["rect"]
@@ -957,38 +1005,75 @@ def _run_report_window(report_data, title):
                             colors["muted"],
                             DT_LEFT | DT_SINGLELINE,
                         )
+        finally:
             gdi32.RestoreDC(hdc, saved_dc)
-            state["last_error"] = None
-        except Exception as exc:
-            state["last_error"] = repr(exc)
+
+    def _paint_error_scene(hdc, client_rect, error_text):
+        user32.FillRect(hdc, ctypes.byref(client_rect), state["root_brush"])
+        _draw_window_frame(hdc, client_rect.right - client_rect.left, client_rect.bottom - client_rect.top, state)
+        fallback_rect = (
+            WINDOW_PADDING,
+            HEADER_HEIGHT,
+            client_rect.right - WINDOW_PADDING,
+            HEADER_HEIGHT + 164,
+        )
+        _draw_round_rect(hdc, fallback_rect, colors["card"], colors["border"], radius=22)
+        _draw_text(
+            hdc,
+            "报告渲染失败",
+            (fallback_rect[0] + 24, fallback_rect[1] + 28, fallback_rect[2] - 24, fallback_rect[1] + 58),
+            fonts["body_bold"],
+            colors["title"],
+            DT_LEFT | DT_SINGLELINE,
+        )
+        _draw_text(
+            hdc,
+            _trim_text(error_text, 110),
+            (fallback_rect[0] + 24, fallback_rect[1] + 70, fallback_rect[2] - 24, fallback_rect[1] + 108),
+            fonts["body"],
+            colors["muted"],
+            DT_LEFT | DT_WORDBREAK,
+        )
+
+    def paint_window(hwnd):
+        paint = PAINTSTRUCT()
+        hdc = user32.BeginPaint(hwnd, ctypes.byref(paint))
+        mem_dc = None
+        mem_bitmap = None
+        old_bitmap = None
+        try:
             client_rect = ctypes.wintypes.RECT()
             user32.GetClientRect(hwnd, ctypes.byref(client_rect))
-            user32.FillRect(hdc, ctypes.byref(client_rect), state["root_brush"])
-            _draw_window_frame(hdc, client_rect.right - client_rect.left, client_rect.bottom - client_rect.top, state)
-            fallback_rect = (
-                WINDOW_PADDING,
-                HEADER_HEIGHT,
-                client_rect.right - WINDOW_PADDING,
-                HEADER_HEIGHT + 164,
-            )
-            _draw_round_rect(hdc, fallback_rect, colors["card"], colors["border"], radius=22)
-            _draw_text(
-                hdc,
-                "报告渲染失败",
-                (fallback_rect[0] + 24, fallback_rect[1] + 28, fallback_rect[2] - 24, fallback_rect[1] + 58),
-                fonts["body_bold"],
-                colors["title"],
-                DT_LEFT | DT_SINGLELINE,
-            )
-            _draw_text(
-                hdc,
-                _trim_text(state["last_error"], 110),
-                (fallback_rect[0] + 24, fallback_rect[1] + 70, fallback_rect[2] - 24, fallback_rect[1] + 108),
-                fonts["body"],
-                colors["muted"],
-                DT_LEFT | DT_WORDBREAK,
-            )
+            client_width = client_rect.right - client_rect.left
+            client_height = client_rect.bottom - client_rect.top
+            if client_width <= 0 or client_height <= 0:
+                return
+
+            mem_dc = gdi32.CreateCompatibleDC(hdc)
+            if mem_dc:
+                mem_bitmap = gdi32.CreateCompatibleBitmap(hdc, client_width, client_height)
+
+            draw_hdc = hdc
+            if mem_dc and mem_bitmap:
+                old_bitmap = gdi32.SelectObject(mem_dc, mem_bitmap)
+                draw_hdc = mem_dc
+
+            try:
+                _paint_scene(draw_hdc, client_rect)
+                state["last_error"] = None
+            except Exception as exc:
+                state["last_error"] = repr(exc)
+                _paint_error_scene(draw_hdc, client_rect, state["last_error"])
+
+            if draw_hdc == mem_dc:
+                gdi32.BitBlt(hdc, 0, 0, client_width, client_height, mem_dc, 0, 0, SRCCOPY)
         finally:
+            if mem_dc and old_bitmap:
+                gdi32.SelectObject(mem_dc, old_bitmap)
+            if mem_bitmap:
+                gdi32.DeleteObject(mem_bitmap)
+            if mem_dc:
+                gdi32.DeleteDC(mem_dc)
             user32.EndPaint(hwnd, ctypes.byref(paint))
 
     def window_proc(hwnd, msg, wparam, lparam):
@@ -1010,6 +1095,7 @@ def _run_report_window(report_data, title):
                 _report_window_state["hwnd"] = hwnd
                 _report_window_state["state"] = state
             update_layout(hwnd)
+            user32.SetTimer(hwnd, REPORT_AUTO_REFRESH_TIMER_ID, AUTO_REFRESH_INTERVAL_MS, None)
             return 0
 
         if msg == WM_ERASEBKGND:
@@ -1017,11 +1103,39 @@ def _run_report_window(report_data, title):
 
         if msg == WM_SIZE:
             update_layout(hwnd)
-            user32.InvalidateRect(hwnd, None, True)
+            user32.InvalidateRect(hwnd, None, False)
             return 0
 
         if msg == WM_PAINT:
             paint_window(hwnd)
+            return 0
+
+        if msg == WM_REPORT_REFRESH:
+            with _report_window_lock:
+                pending_refresh = state.get("pending_refresh")
+                state["pending_refresh"] = None
+            if pending_refresh:
+                report_loader = pending_refresh.get("report_loader")
+                if report_loader is not None:
+                    state["report_loader"] = report_loader
+                _apply_report_data(
+                    state,
+                    pending_refresh["report_data"],
+                    title=pending_refresh["title"],
+                    reset_scroll=True,
+                )
+                user32.SetWindowTextW(hwnd, pending_refresh["title"])
+                user32.InvalidateRect(hwnd, None, False)
+            return 0
+
+        if msg == WM_TIMER and wparam == REPORT_AUTO_REFRESH_TIMER_ID:
+            report_loader = state.get("report_loader")
+            if user32.IsWindowVisible(hwnd) and callable(report_loader):
+                try:
+                    _apply_report_data(state, report_loader(), reset_scroll=False)
+                    user32.InvalidateRect(hwnd, None, False)
+                except Exception as exc:
+                    print(f"[report-window] auto refresh failed: {exc!r}", file=sys.stderr)
             return 0
 
         if msg == WM_NCHITTEST:
@@ -1042,7 +1156,7 @@ def _run_report_window(report_data, title):
             hot = _point_in_rect(point_x, point_y, state["close_rect"])
             if hot != state["close_hot"]:
                 state["close_hot"] = hot
-                user32.InvalidateRect(hwnd, None, True)
+                user32.InvalidateRect(hwnd, None, False)
             return 0
 
         if msg == WM_LBUTTONUP:
@@ -1088,6 +1202,7 @@ def _run_report_window(report_data, title):
             return 0
 
         if msg == WM_DESTROY:
+            user32.KillTimer(hwnd, REPORT_AUTO_REFRESH_TIMER_ID)
             with _report_window_lock:
                 if _report_window_state["hwnd"] == hwnd:
                     _report_window_state["thread"] = None
@@ -1152,12 +1267,12 @@ def _run_report_window(report_data, title):
     user32.UnregisterClassW(class_name, hinstance)
 
 
-def show_report_window(report_data, title="TimeCraft 效率报告"):
-    if _refresh_existing_window(report_data, title):
+def show_report_window(report_data, title="TimeCraft 效率报告", report_loader=None):
+    if _refresh_existing_window(report_data, title, report_loader=report_loader):
         return
     thread = threading.Thread(
         target=_run_report_window,
-        args=(report_data, title),
+        args=(report_data, title, report_loader),
         daemon=True,
         name="report-window",
     )

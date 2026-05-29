@@ -10,7 +10,6 @@ import sys
 import threading
 import signal
 import logging
-from datetime import datetime
 
 # 路径配置：打包后用 exe 所在目录，开发时用脚本目录
 if getattr(sys, 'frozen', False):
@@ -28,36 +27,49 @@ sys.path.insert(0, SCRIPTS_DIR)
 DATA_DIR = os.path.join(PROJECT_DIR, "data")
 
 # 导入现有模块
-import input_hook
 import active_monitor
-
-# 设置 active_monitor 的路径（打包后需要指向 exe 所在目录）
-active_monitor.DATA_DIR = DATA_DIR if 'DATA_DIR' in dir() else os.path.join(PROJECT_DIR, "data")
-active_monitor.ACTIVE_DIR = os.path.join(active_monitor.DATA_DIR, "active")
-active_monitor.HEARTBEAT_FILE = os.path.join(active_monitor.ACTIVE_DIR, "heartbeat")
-active_monitor.LOG_FILE = os.path.join(active_monitor.DATA_DIR, "active_monitor.log")
 
 # 导入托盘模块
 from tray import TrayApp
 
-# 确保数据目录存在
-DATA_DIR = os.path.join(PROJECT_DIR, "data")
 ACTIVE_DIR = os.path.join(DATA_DIR, "active")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(ACTIVE_DIR, exist_ok=True)
 
-# 日志配置
 LOG_FILE = os.path.join(DATA_DIR, "app.log")
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(sys.stderr),
-    ],
-)
 log = logging.getLogger("timecraft")
+
+
+def _configure_logger(log_file):
+    """为托盘主进程配置独立日志，避免被其他模块的 basicConfig 吞掉。"""
+    formatter = logging.Formatter(
+        "[%(asctime)s] [%(levelname)s] %(message)s",
+        "%Y-%m-%d %H:%M:%S",
+    )
+    for handler in list(log.handlers):
+        log.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+
+    log.setLevel(logging.INFO)
+    log.propagate = False
+
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler(sys.stderr)
+    stream_handler.setFormatter(formatter)
+
+    log.addHandler(file_handler)
+    log.addHandler(stream_handler)
+
+
+_configure_logger(LOG_FILE)
+active_monitor.configure_runtime_paths(
+    data_dir=DATA_DIR,
+    log_file=os.path.join(DATA_DIR, "active_monitor.log"),
+)
 
 
 class MonitorManager:
@@ -101,10 +113,10 @@ class MonitorManager:
         """监控线程入口"""
         current_thread = threading.current_thread()
         try:
-            # 设置日志文件
-            input_hook.set_log_file(LOG_FILE)
-
-            # 启动监控
+            active_monitor.configure_runtime_paths(
+                data_dir=DATA_DIR,
+                log_file=os.path.join(DATA_DIR, "active_monitor.log"),
+            )
             active_monitor.run_monitor(stop_event=stop_event)
         except Exception as e:
             log.error(f"监控线程异常: {e}", exc_info=True)

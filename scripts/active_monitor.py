@@ -32,20 +32,52 @@ HOOK_CHECK_INTERVAL = 3  # 每N个循环检查一次输入采样器健康
 ENABLE_INPUT_STATS = os.environ.get("TIMECRAFT_ENABLE_INPUT_STATS", "1") != "0"
 PIXELS_PER_METER = 96 * 39.37007874
 
-# ── 日志 ──
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding='utf-8'),
-        logging.StreamHandler(sys.stderr),
-    ]
-)
 log = logging.getLogger('active_monitor')
 
-# 将日志文件路径传给 input_hook
-input_hook.set_log_file(LOG_FILE)
+
+def _configure_logger(log_file):
+    """为 active_monitor 配置独立日志，避免与主程序 root logger 相互覆盖。"""
+    formatter = logging.Formatter(
+        '[%(asctime)s] [%(levelname)s] %(message)s',
+        '%Y-%m-%d %H:%M:%S',
+    )
+    for handler in list(log.handlers):
+        log.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+
+    log.setLevel(logging.INFO)
+    log.propagate = False
+
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler(sys.stderr)
+    stream_handler.setFormatter(formatter)
+
+    log.addHandler(file_handler)
+    log.addHandler(stream_handler)
+
+
+def configure_runtime_paths(data_dir=None, log_file=None):
+    """重设运行期路径，供打包入口覆盖默认源码目录。"""
+    global DATA_DIR, ACTIVE_DIR, HEARTBEAT_FILE, LOG_FILE
+
+    if data_dir:
+        DATA_DIR = os.path.abspath(data_dir)
+    ACTIVE_DIR = os.path.join(DATA_DIR, "active")
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(ACTIVE_DIR, exist_ok=True)
+
+    HEARTBEAT_FILE = os.path.join(ACTIVE_DIR, "heartbeat")
+    LOG_FILE = log_file or os.path.join(DATA_DIR, "active_monitor.log")
+
+    _configure_logger(LOG_FILE)
+    input_hook.set_log_file(LOG_FILE)
+
+
+configure_runtime_paths(DATA_DIR, LOG_FILE)
 
 # 浏览器标识
 def parse_idea_title(title):
@@ -224,7 +256,13 @@ def save_log_for_date(log_data, date_str):
         json.dump(log_data, f, ensure_ascii=False, indent=2)
 
 
-def write_heartbeat(segments_count=0):
+def write_heartbeat(
+    segments_count=0,
+    current_title=None,
+    current_browser=None,
+    current_start=None,
+    current_date=None,
+):
     """写心跳文件，供 watchdog 检测"""
     try:
         hb = {
@@ -232,6 +270,10 @@ def write_heartbeat(segments_count=0):
             "pid": os.getpid(),
             "hooks_alive": True if not ENABLE_INPUT_STATS else input_hook.is_alive(),
             "segments": segments_count,
+            "current_title": current_title,
+            "current_browser": current_browser,
+            "current_start": current_start,
+            "current_date": current_date,
         }
         with open(HEARTBEAT_FILE, "w", encoding="utf-8") as f:
             json.dump(hb, f)
@@ -309,6 +351,15 @@ def run_monitor(stop_event=None):
     hook_restart_count = 0
     MAX_HOOK_RESTARTS = 10  # 单次运行最大重启次数，防止无限重启
 
+    def update_heartbeat():
+        write_heartbeat(
+            len(segments),
+            current_title=current_title,
+            current_browser=current_browser,
+            current_start=current_start,
+            current_date=current_log_date,
+        )
+
     try:
         while not (stop_event and stop_event.is_set()):
             loop_count += 1
@@ -353,9 +404,6 @@ def run_monitor(stop_event=None):
                     else:
                         log.error(f"输入采样器已重启{MAX_HOOK_RESTARTS}次仍不稳定，跳过健康检查")
 
-            # ── 写心跳 ──
-            write_heartbeat(len(segments))
-
             # 检查空闲
             idle = get_idle_seconds()
             if idle > IDLE_THRESHOLD:
@@ -372,6 +420,7 @@ def run_monitor(stop_event=None):
                     current_title = None
                     current_browser = None
                     current_start = None
+                update_heartbeat()
                 if wait_or_stop(stop_event, POLL_INTERVAL):
                     break
                 continue
@@ -381,6 +430,19 @@ def run_monitor(stop_event=None):
 
             # 过滤系统窗口（只排除桌面和无标题窗口）
             if not title or len(title) < 3:
+                if current_title and current_start:
+                    append_segment(
+                        segments,
+                        current_title,
+                        current_browser,
+                        current_start,
+                        now,
+                        current_log_date,
+                    )
+                    current_title = None
+                    current_browser = None
+                    current_start = None
+                update_heartbeat()
                 if wait_or_stop(stop_event, POLL_INTERVAL):
                     break
                 continue
@@ -455,6 +517,7 @@ def run_monitor(stop_event=None):
                 "date": current_log_date,
             })
             log_data["input_data"] = input_data
+            update_heartbeat()
 
             if wait_or_stop(stop_event, POLL_INTERVAL):
                 break

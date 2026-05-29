@@ -6,8 +6,8 @@
 - `GetAsyncKeyState` 检测按键和鼠标按下沿
 - `GetCursorPos` 累加鼠标移动距离
 
-滚轮统计已暂时禁用。之前的全局鼠标监听会影响系统输入稳定性，
-当前版本优先保证“绝不拖死鼠标”。
+滚轮不再使用全局低层钩子，而是通过隐藏窗口接收 Raw Input，
+优先保证“绝不拖死鼠标”。
 """
 import ctypes
 import ctypes.wintypes
@@ -29,6 +29,8 @@ user32.DefWindowProcW.argtypes = [
     ctypes.wintypes.LPARAM,
 ]
 user32.DefWindowProcW.restype = LRESULT
+user32.RegisterRawInputDevices.restype = ctypes.wintypes.BOOL
+user32.GetRawInputData.restype = ctypes.wintypes.UINT
 
 # ── 日志 ──
 _log_file = None
@@ -108,9 +110,18 @@ POLLED_KEY_VKS = sorted(
 POLLED_MOUSE_VKS = [VK_LBUTTON, VK_RBUTTON]
 POLL_INTERVAL_SEC = 0.02
 HEARTBEAT_TIMEOUT_SEC = 2.0
+WM_INPUT = 0x00FF
 WM_CLOSE = 0x0010
 WM_DESTROY = 0x0002
 WM_CLIPBOARDUPDATE = 0x031D
+RID_INPUT = 0x10000003
+RIM_TYPEMOUSE = 0
+RIDEV_INPUTSINK = 0x00000100
+HID_USAGE_PAGE_GENERIC = 0x01
+HID_USAGE_GENERIC_MOUSE = 0x02
+RI_MOUSE_WHEEL = 0x0400
+WHEEL_DELTA = 120
+UINT_ERROR = 0xFFFFFFFF
 
 WNDPROC = ctypes.WINFUNCTYPE(
     LRESULT,
@@ -134,6 +145,100 @@ class WNDCLASSW(ctypes.Structure):
         ("lpszMenuName", ctypes.wintypes.LPCWSTR),
         ("lpszClassName", ctypes.wintypes.LPCWSTR),
     ]
+
+
+class RAWINPUTDEVICE(ctypes.Structure):
+    _fields_ = [
+        ("usUsagePage", ctypes.c_ushort),
+        ("usUsage", ctypes.c_ushort),
+        ("dwFlags", ctypes.wintypes.DWORD),
+        ("hwndTarget", ctypes.wintypes.HWND),
+    ]
+
+
+class RAWMOUSEBUTTONS(ctypes.Structure):
+    _fields_ = [
+        ("usButtonFlags", ctypes.c_ushort),
+        ("usButtonData", ctypes.c_ushort),
+    ]
+
+
+class RAWMOUSEBUTTONSUNION(ctypes.Union):
+    _anonymous_ = ("buttons",)
+    _fields_ = [
+        ("ulButtons", ctypes.c_ulong),
+        ("buttons", RAWMOUSEBUTTONS),
+    ]
+
+
+class RAWMOUSE(ctypes.Structure):
+    _anonymous_ = ("button_union",)
+    _fields_ = [
+        ("usFlags", ctypes.c_ushort),
+        ("button_union", RAWMOUSEBUTTONSUNION),
+        ("ulRawButtons", ctypes.c_ulong),
+        ("lLastX", ctypes.c_long),
+        ("lLastY", ctypes.c_long),
+        ("ulExtraInformation", ctypes.c_ulong),
+    ]
+
+
+class RAWKEYBOARD(ctypes.Structure):
+    _fields_ = [
+        ("MakeCode", ctypes.c_ushort),
+        ("Flags", ctypes.c_ushort),
+        ("Reserved", ctypes.c_ushort),
+        ("VKey", ctypes.c_ushort),
+        ("Message", ctypes.wintypes.UINT),
+        ("ExtraInformation", ctypes.c_ulong),
+    ]
+
+
+class RAWHID(ctypes.Structure):
+    _fields_ = [
+        ("dwSizeHid", ctypes.wintypes.DWORD),
+        ("dwCount", ctypes.wintypes.DWORD),
+        ("bRawData", ctypes.c_ubyte * 1),
+    ]
+
+
+class RAWINPUTHEADER(ctypes.Structure):
+    _fields_ = [
+        ("dwType", ctypes.wintypes.DWORD),
+        ("dwSize", ctypes.wintypes.DWORD),
+        ("hDevice", ctypes.wintypes.HANDLE),
+        ("wParam", ctypes.wintypes.WPARAM),
+    ]
+
+
+class RAWINPUTDATA(ctypes.Union):
+    _fields_ = [
+        ("mouse", RAWMOUSE),
+        ("keyboard", RAWKEYBOARD),
+        ("hid", RAWHID),
+    ]
+
+
+class RAWINPUT(ctypes.Structure):
+    _anonymous_ = ("data",)
+    _fields_ = [
+        ("header", RAWINPUTHEADER),
+        ("data", RAWINPUTDATA),
+    ]
+
+
+user32.RegisterRawInputDevices.argtypes = [
+    ctypes.POINTER(RAWINPUTDEVICE),
+    ctypes.wintypes.UINT,
+    ctypes.wintypes.UINT,
+]
+user32.GetRawInputData.argtypes = [
+    ctypes.wintypes.HANDLE,
+    ctypes.wintypes.UINT,
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.wintypes.UINT),
+    ctypes.wintypes.UINT,
+]
 
 
 def is_char_vk(vk):
@@ -169,10 +274,10 @@ class InputCounters:
             self.copy_count = 0
             self.paste_count = 0
 
-    def on_key_down(self, vk, ctrl_down, shift_down):
+    def on_key_down(self, vk, ctrl_down, shift_down, alt_down):
         with self._lock:
             self.keys += 1
-            if is_char_vk(vk):
+            if is_char_vk(vk) and not ctrl_down and not alt_down:
                 self.chars += 1
             if (vk == VK_V and ctrl_down) or (vk == VK_INSERT and shift_down):
                 self.paste_count += 1
@@ -251,6 +356,7 @@ _prev_key_states = {}
 _prev_mouse_states = {}
 _last_clipboard_seq = 0
 _clipboard_listener_active = False
+_raw_input_listener_active = False
 
 
 def _is_down(vk):
@@ -292,11 +398,12 @@ def _sample_once():
 
     ctrl_down = _is_down(VK_CONTROL)
     shift_down = _is_down(VK_SHIFT)
+    alt_down = _is_down(VK_MENU)
     for vk in POLLED_KEY_VKS:
         is_down = _is_down(vk)
         was_down = _prev_key_states.get(vk, False)
         if is_down and not was_down:
-            _counters.on_key_down(vk, ctrl_down, shift_down)
+            _counters.on_key_down(vk, ctrl_down, shift_down, alt_down)
         _prev_key_states[vk] = is_down
 
     for vk in POLLED_MOUSE_VKS:
@@ -323,8 +430,73 @@ def _sample_once():
             _last_clipboard_seq = clipboard_seq
 
 
+def _register_raw_mouse_input(hwnd):
+    raw_input_device = RAWINPUTDEVICE(
+        usUsagePage=HID_USAGE_PAGE_GENERIC,
+        usUsage=HID_USAGE_GENERIC_MOUSE,
+        dwFlags=RIDEV_INPUTSINK,
+        hwndTarget=hwnd,
+    )
+    if user32.RegisterRawInputDevices(
+        ctypes.byref(raw_input_device),
+        1,
+        ctypes.sizeof(RAWINPUTDEVICE),
+    ):
+        return True
+    _log("WARN", f"注册 Raw Input 鼠标失败: {ctypes.WinError()}")
+    return False
+
+
+def _handle_raw_input(lparam):
+    raw_size = ctypes.wintypes.UINT(0)
+    header_size = ctypes.sizeof(RAWINPUTHEADER)
+    result = user32.GetRawInputData(
+        ctypes.wintypes.HANDLE(lparam),
+        RID_INPUT,
+        None,
+        ctypes.byref(raw_size),
+        header_size,
+    )
+    if result == UINT_ERROR:
+        raise ctypes.WinError()
+    if raw_size.value < ctypes.sizeof(RAWINPUT):
+        return
+
+    raw_buffer = (ctypes.c_ubyte * raw_size.value)()
+    result = user32.GetRawInputData(
+        ctypes.wintypes.HANDLE(lparam),
+        RID_INPUT,
+        raw_buffer,
+        ctypes.byref(raw_size),
+        header_size,
+    )
+    if result == UINT_ERROR:
+        raise ctypes.WinError()
+    if result < header_size:
+        return
+
+    raw = ctypes.cast(raw_buffer, ctypes.POINTER(RAWINPUT)).contents
+    if raw.header.dwType != RIM_TYPEMOUSE:
+        return
+
+    if not (raw.mouse.usButtonFlags & RI_MOUSE_WHEEL):
+        return
+
+    wheel_delta = ctypes.c_short(raw.mouse.usButtonData).value
+    steps = abs(wheel_delta) // WHEEL_DELTA
+    if steps <= 0:
+        return
+    _counters.on_scroll(wheel_delta > 0, steps=steps)
+
+
 def _window_proc(hwnd, msg, wparam, lparam):
     global _event_hwnd
+    if msg == WM_INPUT:
+        try:
+            _handle_raw_input(lparam)
+        except Exception as e:
+            _log("WARN", f"处理滚轮输入失败: {e}")
+        return 0
     if msg == WM_CLIPBOARDUPDATE:
         try:
             clipboard_seq = user32.GetClipboardSequenceNumber()
@@ -352,7 +524,7 @@ def _window_proc(hwnd, msg, wparam, lparam):
 
 
 def _event_loop(stop_event, ready_event):
-    global _event_hwnd, _event_wndproc, _clipboard_listener_active
+    global _event_hwnd, _event_wndproc, _clipboard_listener_active, _raw_input_listener_active
 
     class_name = f"TimeCraftInputWindow_{os.getpid()}"
     hinstance = kernel32.GetModuleHandleW(None)
@@ -387,6 +559,9 @@ def _event_loop(stop_event, ready_event):
         return
 
     _event_hwnd = hwnd
+    _raw_input_listener_active = _register_raw_mouse_input(hwnd)
+    if _raw_input_listener_active:
+        _log("INFO", "Raw Input 鼠标监听已启动")
 
     if not user32.AddClipboardFormatListener(hwnd):
         _log("WARN", "注册剪贴板监听失败，复制统计将退化为轮询")
@@ -411,6 +586,7 @@ def _event_loop(stop_event, ready_event):
         except Exception:
             pass
     _clipboard_listener_active = False
+    _raw_input_listener_active = False
     _log("INFO", "输入事件窗口已退出")
 
 
@@ -472,7 +648,7 @@ def stop():
     """停止输入采样线程。"""
     global _sampler_thread, _sampler_stop_event
     global _event_thread, _event_stop_event, _event_ready_event, _event_hwnd
-    global _clipboard_listener_active
+    global _clipboard_listener_active, _raw_input_listener_active
     _log("INFO", "正在停止输入采样器...")
     if _sampler_stop_event:
         _sampler_stop_event.set()
@@ -495,6 +671,7 @@ def stop():
     _event_ready_event = None
     _event_hwnd = None
     _clipboard_listener_active = False
+    _raw_input_listener_active = False
 
     _set_heartbeat(0.0)
     _log("INFO", "输入采样器已停止")
