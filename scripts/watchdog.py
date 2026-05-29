@@ -21,10 +21,9 @@ import logging
 from datetime import datetime
 
 # ── 配置 ──
-DATA_DIR = "E:/bumoren/time-craft/data"
-SCRIPTS_DIR = os.path.join(DATA_DIR, "../scripts").replace("\\", "/")
-# 修正路径
-SCRIPTS_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(PROJECT_DIR, "data")
+SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 HEARTBEAT_FILE = os.path.join(DATA_DIR, "active", "heartbeat")
 LOG_FILE = os.path.join(DATA_DIR, "watchdog.log")
 MONITOR_SCRIPT = os.path.join(SCRIPTS_DIR, "active_monitor.py")
@@ -105,7 +104,7 @@ def start_monitor():
     try:
         # 使用 pythonw 无窗口启动，或 python -u
         proc = subprocess.Popen(
-            ['python', '-u', MONITOR_SCRIPT],
+            [sys.executable, '-u', MONITOR_SCRIPT],
             cwd=SCRIPTS_DIR,
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0,
         )

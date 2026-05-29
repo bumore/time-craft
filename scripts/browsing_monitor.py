@@ -19,12 +19,14 @@ from collections import defaultdict
 
 # ── 配置 ──
 HOME = os.path.expanduser("~")
-DATA_DIR = "E:\\bumoren\\time-craft\\data"
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(PROJECT_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 DAILY_DIR = os.path.join(DATA_DIR, "daily")
 os.makedirs(DAILY_DIR, exist_ok=True)
+PIXELS_PER_METER = 96 * 39.37007874
 
 # 浏览器历史数据库路径
 BROWSERS = {
@@ -142,6 +144,36 @@ def get_domain(url):
     except Exception:
         return url
 
+
+def summarize_clicks(records):
+    """汇总点击数，兼容旧数据。"""
+    total_clicks = 0
+    left_clicks = 0
+    right_clicks = 0
+    for record in records:
+        if "left_clicks" in record or "right_clicks" in record:
+            left = record.get("left_clicks", 0)
+            right = record.get("right_clicks", 0)
+            left_clicks += left
+            right_clicks += right
+            total_clicks += left + right
+        else:
+            total_clicks += record.get("clicks", 0)
+    return total_clicks, left_clicks, right_clicks
+
+
+def summarize_scrolls(records):
+    """汇总滚轮次数。"""
+    total_scroll_up = sum(record.get("scroll_up", 0) for record in records)
+    total_scroll_down = sum(record.get("scroll_down", 0) for record in records)
+    return total_scroll_up, total_scroll_down, total_scroll_up + total_scroll_down
+
+
+def format_mouse_distance(mouse_dist):
+    """格式化鼠标移动距离，附带米制近似值。"""
+    meters = mouse_dist / PIXELS_PER_METER
+    return f"{mouse_dist} 像素 (约{meters:.2f}米)"
+
 def load_state():
     """加载上次运行状态"""
     if os.path.exists(STATE_FILE):
@@ -208,6 +240,7 @@ def read_browser_history(db_path, browser_name, after_timestamp=None):
                 "title": title or "",
                 "visit_count": visit_count or 1,
                 "timestamp": unix_ts,
+                "last_visit_time": last_visit_time,
                 "datetime": visit_dt.strftime("%Y-%m-%d %H:%M:%S"),
                 "browser": browser_name,
                 "domain": get_domain(url),
@@ -239,18 +272,22 @@ def compute_browsing_sessions(entries, gap_minutes=30):
 
     sessions = []
     current_domain = None
+    current_browser = None
     session_start = None
+    last_timestamp = None
     session_entries = []
 
     for entry in sorted_entries:
         domain = entry["domain"]
+        browser = entry.get("browser")
         ts = entry["timestamp"]
 
-        if current_domain == domain and session_start:
-            time_gap = (ts - session_start) / 60  # 分钟
+        if current_domain == domain and current_browser == browser and last_timestamp is not None:
+            time_gap = (ts - last_timestamp) / 60  # 分钟
             if time_gap < gap_minutes:
                 # 同一会话
                 session_entries.append(entry)
+                last_timestamp = ts
                 continue
 
         # 新会话
@@ -258,6 +295,7 @@ def compute_browsing_sessions(entries, gap_minutes=30):
             duration = (session_entries[-1]["timestamp"] - session_entries[0]["timestamp"]) / 60
             sessions.append({
                 "domain": current_domain,
+                "browser": current_browser,
                 "category": session_entries[0]["category"],
                 "title": session_entries[-1]["title"],
                 "start_time": session_entries[0]["datetime"],
@@ -267,7 +305,9 @@ def compute_browsing_sessions(entries, gap_minutes=30):
             })
 
         current_domain = domain
+        current_browser = browser
         session_start = ts
+        last_timestamp = ts
         session_entries = [entry]
 
     # 最后一个会话
@@ -275,6 +315,7 @@ def compute_browsing_sessions(entries, gap_minutes=30):
         duration = (session_entries[-1]["timestamp"] - session_entries[0]["timestamp"]) / 60
         sessions.append({
             "domain": current_domain,
+            "browser": current_browser,
             "category": session_entries[0]["category"],
             "title": session_entries[-1]["title"],
             "start_time": session_entries[0]["datetime"],
@@ -399,6 +440,7 @@ def generate_hierarchical_report(entries, sessions, active_segments, report_date
     # ── Level 1: 程序活跃时长 ──
     app_time = defaultdict(float)
     app_order = []  # 保持出现顺序
+    browser_detail = defaultdict(lambda: defaultdict(float))
 
     if active_segments:
         for seg in active_segments:
@@ -406,12 +448,16 @@ def generate_hierarchical_report(entries, sessions, active_segments, report_date
             if app not in app_time:
                 app_order.append(app)
             app_time[app] += seg.get("duration_sec", 0) / 60
+            if seg.get("browser"):
+                browser_detail[seg["browser"]][seg.get("title", "未知页面")] += seg.get("duration_sec", 0) / 60
     else:
         # 降级：用浏览器历史数据估算
         if sessions:
             browser_total = defaultdict(float)
             for s in sessions:
-                browser_total["Chrome"] += s["duration_min"]
+                browser_total[s.get("browser", "未知浏览器")] += s["duration_min"]
+                page_name = s.get("title") or s.get("domain") or "未知页面"
+                browser_detail[s.get("browser", "未知浏览器")][page_name] += s["duration_min"]
             for b, t in browser_total.items():
                 app_time[b] = t
                 app_order.append(b)
@@ -468,7 +514,7 @@ def generate_hierarchical_report(entries, sessions, active_segments, report_date
     lines.append("")
 
     # ── Level 1 列表 ──
-    lines.append("📱 程序使用时长 (Level 1)")
+    lines.append("📱 程序统计 (Level 1)")
     lines.append("-" * 38)
 
     # 进程名图标映射
@@ -501,37 +547,14 @@ def generate_hierarchical_report(entries, sessions, active_segments, report_date
         bar = "█" * bar_len + "░" * (20 - bar_len)
         lines.append(f"  {icon} {app}: {m}分钟 ({pct_str})")
         lines.append(f"     {bar}")
-
-    # ══════════════════════════════════════
-    # ── Level 2: 浏览器网站详情 ──
-    # ══════════════════════════════════════
-    if sessions:
-        lines.append("")
-        lines.append("🌐 浏览器网站详情 (Level 2)")
-        lines.append("=" * 38)
-
-        # 按浏览器分组
-        browser_sessions = defaultdict(list)
-        for s in sessions:
-            browser_sessions["Chrome"].append(s)
-
-        for browser, bsessions in browser_sessions.items():
-            if browser not in app_time:
-                continue
-
-            # 域名时长统计
-            domain_time = defaultdict(float)
-            domain_title = {}
-            for s in bsessions:
-                domain_time[s["domain"]] += s["duration_min"]
-                if s["title"]:
-                    domain_title[s["domain"]] = s["title"]
-
-            for domain, t in sorted(domain_time.items(), key=lambda x: -x[1]):
-                m = int(t)
-                if m >= 1:
-                    title = domain_title.get(domain, "")[:25]
-                    lines.append(f"  {domain}  {m}分钟")
+        page_time = browser_detail.get(app)
+        if page_time:
+            sorted_pages = sorted(page_time.items(), key=lambda x: -x[1])[:8]
+            for page, page_minutes in sorted_pages:
+                pm = int(page_minutes)
+                if pm >= 1:
+                    page_pct = page_minutes / t * 100 if t > 0 else 0
+                    lines.append(f"    - {page[:32]}  {pm}分钟 ({page_pct:.0f}%)")
 
     # ══════════════════════════════════════
     # ── Level 2: IDEA 项目详情 ──
@@ -595,7 +618,8 @@ def generate_hierarchical_report(entries, sessions, active_segments, report_date
         today_records = [r for r in input_records if r.get("date") == report_date]
         if today_records:
             total_keys = sum(r["keys"] for r in today_records)
-            total_clicks = sum(r["clicks"] for r in today_records)
+            total_clicks, left_clicks, right_clicks = summarize_clicks(today_records)
+            total_scroll_up, total_scroll_down, total_scroll = summarize_scrolls(today_records)
             total_mouse_dist = sum(r["mouse_dist"] for r in today_records)
             total_copy = sum(r.get("copy", 0) for r in today_records)
             total_paste = sum(r.get("paste", 0) for r in today_records)
@@ -611,19 +635,15 @@ def generate_hierarchical_report(entries, sessions, active_segments, report_date
             active_hours = sorted(hourly_keys.items(), key=lambda x: -x[1])
 
             lines.append("")
-            lines.append("⌨ 鼠标键盘活动")
+            lines.append("⌨ 键盘统计")
             lines.append("=" * 38)
-            lines.append(f"  ⌨ 总按键: {total_keys} 次")
-            lines.append(f"  📝 输入字数: {total_chars} 字")
-            lines.append(f"  🖱 总点击: {total_clicks} 次")
-            lines.append(f"  📏 鼠标移动: {total_mouse_dist} 像素")
-            lines.append(f"  📋 复制: {total_copy} 次")
-            lines.append(f"  📄 粘贴: {total_paste} 次")
+            lines.append(f"  ⌨ 总按键次数: {total_keys} 次")
+            lines.append(f"  📝 字符键次数: {total_chars} 次")
 
             # 活跃度曲线
             if active_hours:
                 lines.append("")
-                lines.append("  📈 活跃度曲线 (按键/时段):")
+                lines.append("  📈 按键活跃时段:")
                 max_keys = max(v for _, v in active_hours) if active_hours else 1
                 for hour, keys in active_hours:
                     if keys > 0:
@@ -631,6 +651,23 @@ def generate_hierarchical_report(entries, sessions, active_segments, report_date
                         bar = "█" * bar_len + "░" * (20 - bar_len)
                         hour_label = hour.split(" ")[1] + ":00"
                         lines.append(f"    {hour_label} {bar} {keys}")
+
+            lines.append("")
+            lines.append("📋 剪贴板统计")
+            lines.append("=" * 38)
+            lines.append(f"  📋 复制: {total_copy} 次")
+            lines.append(f"  📄 粘贴: {total_paste} 次")
+
+            lines.append("")
+            lines.append("🖱 鼠标统计")
+            lines.append("=" * 38)
+            lines.append(f"  🖱 总点击次数: {total_clicks} 次")
+            lines.append(f"  ↖ 左键点击: {left_clicks} 次")
+            lines.append(f"  ↗ 右键点击: {right_clicks} 次")
+            lines.append(f"  ↕ 滚轮总次数: {total_scroll} 次")
+            lines.append(f"  ⤒ 向上滚动: {total_scroll_up} 次")
+            lines.append(f"  ⤓ 向下滚动: {total_scroll_down} 次")
+            lines.append(f"  📏 鼠标移动: {format_mouse_distance(total_mouse_dist)}")
 
     return "\n".join(lines)
 
@@ -652,8 +689,7 @@ def run_collect():
         print(f"  {browser}: 读取 {len(entries)} 条记录")
 
         if entries:
-            max_ts = max(e["timestamp"] for e in entries)
-            new_last_ts[browser] = int(max_ts * 1_000_000)  # 转为 WebKit 微秒
+            new_last_ts[browser] = max(e["last_visit_time"] for e in entries)
         elif browser in last_ts:
             new_last_ts[browser] = last_ts[browser]
 
